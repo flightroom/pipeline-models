@@ -1,0 +1,195 @@
+# Flightroom pipeline: frontend served as a static bundle by Flightroom (a remote: Vite, webpack, Angular...),
+# with pnpm.
+#
+# Pushes to main and pull requests: install, test and build.
+# A tag <version>: install, test and build, then the build output is zipped and uploaded to Flightroom as
+# that version of the frontend. Plain curl against the Flightroom API: no Marketplace extension needed.
+#
+# Set up once per Azure DevOps project (see the README of the pipeline models repository):
+#   Variable group MFE_ORCHESTRATOR_SECRETS
+#     FLIGHTROOM_API_KEY  secret: an API key of the Flightroom project
+#     FLIGHTROOM_DOMAIN   optional: Flightroom base URL, defaults to %domain%
+#   An internal npm registry goes in the repository's .npmrc; corepack fetches pnpm from
+#   COREPACK_NPM_REGISTRY when set (a pipeline variable).
+#
+# The parameters below are read when the pipeline is compiled. Change their defaults in your pipeline
+# models repository: every repository Flightroom creates afterwards gets them.
+
+parameters:
+  - name: agentPool
+    displayName: Agent pool ("Azure Pipelines" is the Microsoft-hosted one)
+    type: string
+    default: Azure Pipelines
+  - name: vmImage
+    displayName: Microsoft-hosted image (ignored on a self-hosted pool)
+    type: string
+    default: ubuntu-latest
+  - name: nodeVersion
+    displayName: Node.js version
+    type: string
+    default: '24.x'
+  - name: buildOutput
+    displayName: Build output folder to upload ("auto" takes the first of dist, build, out)
+    type: string
+    default: auto
+
+trigger:
+  branches:
+    include:
+      - main
+  tags:
+    include:
+      - '*'
+
+# GitHub and Bitbucket only: Azure Repos validates pull requests through a build policy on main
+pr:
+  branches:
+    include:
+      - main
+
+pool:
+  name: ${{ parameters.agentPool }}
+  ${{ if eq(parameters.agentPool, 'Azure Pipelines') }}:
+    vmImage: ${{ parameters.vmImage }}
+
+variables:
+  FLIGHTROOM_SLUG: '%microfrontendSlug%'
+  PNPM_STORE: $(Pipeline.Workspace)/.pnpm-store
+
+stages:
+  - stage: Build
+    displayName: Build and test
+    jobs:
+      - job: Build
+        displayName: Install, test and build
+        steps:
+          - task: NodeTool@0
+            displayName: Use Node.js ${{ parameters.nodeVersion }}
+            inputs:
+              versionSpec: ${{ parameters.nodeVersion }}
+
+          # pnpm comes in the version of the packageManager field of package.json. Node.js 25 and later no
+          # longer bundle corepack: npm installs it then, from the registry npm is configured with.
+          - script: |
+              set -euo pipefail
+              command -v corepack > /dev/null || npm install --global corepack
+              corepack enable
+            displayName: Enable pnpm
+
+          - task: Cache@2
+            displayName: Cache the pnpm store
+            inputs:
+              key: 'pnpm | "$(Agent.OS)" | pnpm-lock.yaml'
+              restoreKeys: |
+                pnpm | "$(Agent.OS)"
+              path: $(PNPM_STORE)
+
+          - script: pnpm install --frozen-lockfile --store-dir "$PNPM_STORE"
+            displayName: Install dependencies
+
+          - script: pnpm run --if-present test
+            displayName: Test
+
+          - script: pnpm run --if-present build
+            displayName: Build
+
+          # Published when the test script writes JUnit (e.g. vitest --reporter=junit --outputFile=test-results/junit.xml)
+          - task: PublishTestResults@2
+            displayName: Publish test results
+            condition: succeededOrFailed()
+            inputs:
+              testResultsFormat: JUnit
+              testResultsFiles: |
+                **/test-results/**/*.xml
+                **/junit*.xml
+                !**/node_modules/**
+              testRunTitle: Tests
+
+          # Checked on every run, so a build that stops producing its output fails before a release does
+          - script: |
+              set -euo pipefail
+              output="$BUILD_OUTPUT"
+              if [ "$output" = auto ]; then
+                output=""
+                for candidate in dist build out; do
+                  if [ -d "$candidate" ]; then output="$candidate"; break; fi
+                done
+              fi
+              if [ -z "$output" ] || [ ! -d "$output" ] || [ -z "$(ls -A "$output")" ]; then
+                echo "##vso[task.logissue type=error]No build output: none of dist, build, out exists, or it is empty. Set the buildOutput parameter."
+                exit 1
+              fi
+              echo "Build output: $output"
+              echo "##vso[task.setvariable variable=FLIGHTROOM_BUILD_OUTPUT]$output"
+            displayName: Find the build output
+            env:
+              BUILD_OUTPUT: ${{ parameters.buildOutput }}
+
+          # The files of the output go at the root of the zip, as Flightroom serves them
+          - task: ArchiveFiles@2
+            displayName: Zip the build output
+            condition: and(succeeded(), startsWith(variables['Build.SourceBranch'], 'refs/tags/'))
+            inputs:
+              rootFolderOrFile: $(Build.SourcesDirectory)/$(FLIGHTROOM_BUILD_OUTPUT)
+              includeRootFolder: false
+              archiveType: zip
+              archiveFile: $(Build.ArtifactStagingDirectory)/bundle/bundle.zip
+              replaceExistingArchive: true
+
+          - task: PublishPipelineArtifact@1
+            displayName: Publish the bundle
+            condition: and(succeeded(), startsWith(variables['Build.SourceBranch'], 'refs/tags/'))
+            inputs:
+              targetPath: $(Build.ArtifactStagingDirectory)/bundle
+              artifact: bundle
+
+  - stage: Release
+    displayName: Release
+    dependsOn: Build
+    condition: and(succeeded(), startsWith(variables['Build.SourceBranch'], 'refs/tags/'))
+    variables:
+      # Defaults first: the group is listed after them, so a value it holds wins
+      - name: FLIGHTROOM_DOMAIN
+        value: '%domain%'
+      - group: MFE_ORCHESTRATOR_SECRETS
+    jobs:
+      - job: Upload
+        displayName: Upload the bundle
+        steps:
+          - checkout: none
+
+          - task: DownloadPipelineArtifact@2
+            displayName: Download the bundle
+            inputs:
+              artifact: bundle
+              path: $(Pipeline.Workspace)/bundle
+
+          # Pipeline values reach the script through env only: a $(…) macro pasted into a script body is
+          # substituted as text before bash runs, so a tag could inject shell. The tag is never echoed either,
+          # since "##vso[" in it would be read as a logging command.
+          - script: |
+              set -euo pipefail
+              version="${BUILD_SOURCEBRANCH#refs/tags/}"
+              if ! [[ "$version" =~ ^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$ ]]; then
+                echo "##vso[task.logissue type=error]The tag is not a valid version: letters, digits, '.', '_' and '-' only, at most 128, not starting with '.' or '-'"
+                exit 1
+              fi
+              case "$FLIGHTROOM_API_KEY" in
+                '' | '$('*)
+                  echo "##vso[task.logissue type=error]FLIGHTROOM_API_KEY is not set: add it as a secret to the variable group MFE_ORCHESTRATOR_SECRETS"
+                  exit 1 ;;
+              esac
+              base="${FLIGHTROOM_DOMAIN%/}"
+              base="${base%/api}"
+              url="$base/api/frontends/by-slug/$SLUG/upload/$version"
+              echo "Uploading the bundle: POST $url"
+              # The key goes in through stdin, so it never shows in the process list of a shared agent.
+              # No --retry: every upload of a version is recorded.
+              printf 'api-key: %s\n' "$FLIGHTROOM_API_KEY" \
+                | curl --fail-with-body --show-error --silent -X POST -H @- -H 'Accept: application/json' \
+                  -F "file=@$PIPELINE_WORKSPACE/bundle/bundle.zip;type=application/zip" "$url"
+            displayName: Upload to Flightroom
+            env:
+              FLIGHTROOM_API_KEY: $(FLIGHTROOM_API_KEY)
+              FLIGHTROOM_DOMAIN: $(FLIGHTROOM_DOMAIN)
+              SLUG: $(FLIGHTROOM_SLUG)

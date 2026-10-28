@@ -1,0 +1,122 @@
+# Flightroom pipeline: frontend served as a static bundle by Flightroom (a remote: Vite, webpack, Angular...),
+# with pnpm.
+#
+# Merge requests and pushes to the default branch: install, test and build.
+# A tag <version>: install, test and build, then the build output is zipped and uploaded to Flightroom as
+# that version of the frontend.
+#
+# Set up once, as CI/CD variables of the group (see the README of the pipeline models repository):
+#   FLIGHTROOM_API_KEY  masked: an API key of the Flightroom project
+# Every variable of the "variables:" block below can be overridden the same way, group or project
+# variables win over these defaults: the Flightroom URL, the build output folder and the images of the
+# jobs (point them to a mirror). An internal npm registry goes in the repository's .npmrc; corepack fetches
+# pnpm from COREPACK_NPM_REGISTRY when set.
+
+workflow:
+  rules:
+    - if: $CI_COMMIT_TAG
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+stages:
+  - build
+  - upload
+
+variables:
+  FLIGHTROOM_SLUG: "%microfrontendSlug%"
+  FLIGHTROOM_DOMAIN: "%domain%"
+  # The build output folder to upload. Empty: the first of dist, build, out
+  FLIGHTROOM_BUILD_OUTPUT: ""
+  FLIGHTROOM_BUILD_IMAGE: node:24
+  FLIGHTROOM_CURL_IMAGE: curlimages/curl:8.11.1
+
+build:
+  stage: build
+  image: $FLIGHTROOM_BUILD_IMAGE
+  interruptible: true
+  cache:
+    key:
+      files:
+        - pnpm-lock.yaml
+    paths:
+      - .pnpm-store
+  # pnpm comes in the version of the packageManager field of package.json. Node.js 25 and later no longer
+  # bundle corepack: npm installs it then, from the registry npm is configured with.
+  script:
+    - command -v corepack > /dev/null || npm install --global corepack
+    - corepack enable
+    - pnpm install --frozen-lockfile --store-dir "$CI_PROJECT_DIR/.pnpm-store"
+    - pnpm run --if-present test
+    - pnpm run --if-present build
+    # Zipped on every run, so a build that stops producing its output fails before a release does. The
+    # files of the output go at the root of the zip, as Flightroom serves them.
+    - |
+      set -eu
+      OUTPUT="$FLIGHTROOM_BUILD_OUTPUT"
+      if [ -z "$OUTPUT" ]; then
+        for CANDIDATE in dist build out; do
+          if [ -d "$CANDIDATE" ]; then OUTPUT="$CANDIDATE"; break; fi
+        done
+      fi
+      if [ -z "$OUTPUT" ] || [ ! -d "$OUTPUT" ] || [ -z "$(ls -A "$OUTPUT")" ]; then
+        echo "No build output: none of dist, build, out exists, or it is empty. Set FLIGHTROOM_BUILD_OUTPUT."
+        exit 1
+      fi
+      echo "Build output: $OUTPUT"
+      if command -v zip > /dev/null; then
+        (cd "$OUTPUT" && zip -qr "$CI_PROJECT_DIR/bundle.zip" .)
+      else
+        python3 - "$OUTPUT" bundle.zip <<'PY'
+      import os, sys, zipfile
+      source, target = sys.argv[1], sys.argv[2]
+      with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as archive:
+          for folder, _, files in os.walk(source):
+              for name in files:
+                  path = os.path.join(folder, name)
+                  archive.write(path, os.path.relpath(path, source))
+      PY
+      fi
+  artifacts:
+    when: always
+    expire_in: 1 day
+    paths:
+      - bundle.zip
+    # Read when the test script writes JUnit (e.g. vitest --reporter=junit --outputFile=test-results/junit.xml)
+    reports:
+      junit:
+        - "test-results/**/*.xml"
+        - "junit*.xml"
+
+upload:
+  stage: upload
+  image:
+    name: $FLIGHTROOM_CURL_IMAGE
+    entrypoint: [""]
+  variables:
+    GIT_STRATEGY: none
+  needs:
+    - build
+  rules:
+    - if: $CI_COMMIT_TAG
+  script:
+    - |
+      set -eu
+      case "$CI_COMMIT_TAG" in
+        "" | [.-]* | *[!A-Za-z0-9._-]*)
+          echo "The tag is not a valid version: letters, digits, '.', '_' and '-' only, not starting with '.' or '-'"
+          exit 1 ;;
+      esac
+      if [ "${#CI_COMMIT_TAG}" -gt 128 ]; then echo "The tag is longer than 128 characters"; exit 1; fi
+      if [ -z "${FLIGHTROOM_API_KEY:-}" ]; then
+        echo "The CI/CD variable FLIGHTROOM_API_KEY is not set"
+        exit 1
+      fi
+      BASE="${FLIGHTROOM_DOMAIN%/}"
+      BASE="${BASE%/api}"
+      URL="$BASE/api/frontends/by-slug/$FLIGHTROOM_SLUG/upload/$CI_COMMIT_TAG"
+      echo "Uploading the bundle: POST $URL"
+      # The key goes in through stdin, so it never shows in the process list of a shared runner.
+      # No --retry: every upload of a version is recorded.
+      printf 'api-key: %s\n' "$FLIGHTROOM_API_KEY" \
+        | curl --fail-with-body --show-error --silent -X POST -H @- -H 'Accept: application/json' \
+          -F "file=@bundle.zip;type=application/zip" "$URL"

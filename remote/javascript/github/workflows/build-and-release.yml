@@ -1,0 +1,126 @@
+# Flightroom pipeline: frontend served as a static bundle by Flightroom (a remote: Vite, webpack, Angular...),
+# with pnpm.
+#
+# Pushes to main and pull requests: install, test and build.
+# A tag <version>: install, test and build, then the build output is zipped and uploaded to Flightroom as
+# that version of the frontend.
+#
+# Set up once, on the organization or the repository (see the README of the pipeline models repository):
+#   Secret   FLIGHTROOM_API_KEY       an API key of the Flightroom project
+#   Variable FLIGHTROOM_DOMAIN        optional: Flightroom base URL, defaults to %domain%
+#   Variable FLIGHTROOM_RUNNER        optional: runner label, defaults to ubuntu-latest
+#   Variable FLIGHTROOM_NODE_VERSION  optional: Node.js version, defaults to 24
+#   Variable FLIGHTROOM_BUILD_OUTPUT  optional: build output folder to upload, defaults to the first of dist, build, out
+
+name: Build and release
+
+on:
+  push:
+    branches: [main]
+    tags: ['*']
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  FLIGHTROOM_SLUG: '%microfrontendSlug%'
+
+jobs:
+  build:
+    name: Install, test and build
+    runs-on: ${{ vars.FLIGHTROOM_RUNNER || 'ubuntu-latest' }}
+    steps:
+      - uses: actions/checkout@v7
+
+      # pnpm in the version of the packageManager field of package.json
+      - uses: pnpm/action-setup@v6
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ vars.FLIGHTROOM_NODE_VERSION || '24' }}
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm run --if-present test
+      - run: pnpm run --if-present build
+
+      # Checked on every run, so a build that stops producing its output fails before a release does
+      - name: Find the build output
+        id: output
+        env:
+          BUILD_OUTPUT: ${{ vars.FLIGHTROOM_BUILD_OUTPUT }}
+        run: |
+          set -euo pipefail
+          output="$BUILD_OUTPUT"
+          if [ -z "$output" ]; then
+            for candidate in dist build out; do
+              if [ -d "$candidate" ]; then output="$candidate"; break; fi
+            done
+          fi
+          if [ -z "$output" ] || [ ! -d "$output" ] || [ -z "$(ls -A "$output")" ]; then
+            echo "::error::No build output: none of dist, build, out exists, or it is empty. Set the variable FLIGHTROOM_BUILD_OUTPUT."
+            exit 1
+          fi
+          echo "dir=$output" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v7
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          name: bundle
+          path: ${{ steps.output.outputs.dir }}
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 1
+
+  release:
+    name: Upload the bundle
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ${{ vars.FLIGHTROOM_RUNNER || 'ubuntu-latest' }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: bundle
+          path: bundle
+
+      # Values reach the script through env only: ${{ }} pasted into a script body is substituted as text
+      # before bash runs, so a tag could inject shell
+      - name: Upload to Flightroom
+        env:
+          FLIGHTROOM_API_KEY: ${{ secrets.FLIGHTROOM_API_KEY }}
+          FLIGHTROOM_DOMAIN: ${{ vars.FLIGHTROOM_DOMAIN || '%domain%' }}
+          VERSION: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$VERSION" =~ ^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$ ]]; then
+            echo "::error::The tag is not a valid version: letters, digits, '.', '_' and '-' only, at most 128, not starting with '.' or '-'"
+            exit 1
+          fi
+          if [ -z "$FLIGHTROOM_API_KEY" ]; then
+            echo "::error::The secret FLIGHTROOM_API_KEY is not set"
+            exit 1
+          fi
+          # The files of the output go at the root of the zip, as Flightroom serves them
+          if command -v zip > /dev/null; then
+            (cd bundle && zip -qr ../bundle.zip .)
+          else
+            python3 - bundle bundle.zip <<'PY'
+          import os, sys, zipfile
+          source, target = sys.argv[1], sys.argv[2]
+          with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as archive:
+              for folder, _, files in os.walk(source):
+                  for name in files:
+                      path = os.path.join(folder, name)
+                      archive.write(path, os.path.relpath(path, source))
+          PY
+          fi
+          base="${FLIGHTROOM_DOMAIN%/}"
+          base="${base%/api}"
+          url="$base/api/frontends/by-slug/$FLIGHTROOM_SLUG/upload/$VERSION"
+          echo "Uploading the bundle: POST $url"
+          # The key goes in through stdin, so it never shows in the process list of a shared runner.
+          # No --retry: every upload of a version is recorded.
+          printf 'api-key: %s\n' "$FLIGHTROOM_API_KEY" \
+            | curl --fail-with-body --show-error --silent -X POST -H @- -H 'Accept: application/json' \
+              -F "file=@bundle.zip;type=application/zip" "$url"
