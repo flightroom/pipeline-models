@@ -1,0 +1,191 @@
+# Flightroom pipeline: Python backend (FastAPI...), installed with pip.
+#
+# Merge requests and pushes to the default branch: install and test (pytest).
+# A tag <version>: install and test, then the image <registry>/<prefix>/<slug>:<version> is built from the
+# repository's Dockerfile, pushed, and registered as that version of the backend in Flightroom.
+#
+# Set up once, as CI/CD variables of the group (see the README of the pipeline models repository):
+#   FLIGHTROOM_API_KEY  masked: an API key of the Flightroom project with the MANAGER role
+# Every variable of the "variables:" block below can be overridden the same way, group or project
+# variables win over these defaults: the Flightroom URL, the registry and its credentials, the image
+# builder (dind, the runner's docker, or kaniko) and the images of every job (point them to a mirror).
+# pip reads an internal index from PIP_INDEX_URL, a CI/CD variable as well.
+
+workflow:
+  rules:
+    - if: $CI_COMMIT_TAG
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+stages:
+  - test
+  - image
+  - register
+
+variables:
+  FLIGHTROOM_SLUG: "%serviceSlug%"
+  FLIGHTROOM_DOMAIN: "%domain%"
+  # Full image repository, without tag. Empty: <FLIGHTROOM_IMAGE_PREFIX>/<slug>, or the project's own
+  # GitLab registry ($CI_REGISTRY_IMAGE) when no prefix is set either
+  FLIGHTROOM_IMAGE_REPOSITORY: ""
+  FLIGHTROOM_IMAGE_PREFIX: ""
+  # Login: the host of the image repository, with GitLab's job credentials unless overridden
+  FLIGHTROOM_REGISTRY_USER: $CI_REGISTRY_USER
+  FLIGHTROOM_REGISTRY_PASSWORD: $CI_REGISTRY_PASSWORD
+  # dind: a docker:dind service; docker: the runner's own Docker daemon (socket mounted, or a shell
+  # runner); kaniko: no daemon nor privileged mode
+  FLIGHTROOM_IMAGE_BUILDER: dind
+  FLIGHTROOM_BUILD_IMAGE: python:3.15
+  FLIGHTROOM_DOCKER_IMAGE: docker:29
+  FLIGHTROOM_DIND_IMAGE: docker:29-dind
+  FLIGHTROOM_KANIKO_IMAGE: gcr.io/kaniko-project/executor:v1.23.2-debug
+  FLIGHTROOM_CURL_IMAGE: curlimages/curl:8.11.1
+
+test:
+  stage: test
+  image: $FLIGHTROOM_BUILD_IMAGE
+  interruptible: true
+  variables:
+    PIP_CACHE_DIR: $CI_PROJECT_DIR/.pip-cache
+  cache:
+    key: pip-$CI_JOB_NAME
+    paths:
+      - .pip-cache
+  # constraints.txt pins every version when the repository has one; the project's "dev" extra brings the
+  # test tools. pytest exiting 5 means no test collected, which a repository just created may well be.
+  script:
+    - |
+      set -eu
+      set --
+      if [ -f constraints.txt ]; then set -- -c constraints.txt; fi
+      if [ -f requirements.txt ]; then python -m pip install "$@" -r requirements.txt; fi
+      if [ -f requirements-dev.txt ]; then python -m pip install "$@" -r requirements-dev.txt; fi
+      if [ -f pyproject.toml ] || [ -f setup.py ]; then python -m pip install "$@" -e ".[dev]"; fi
+      python -m pytest --junitxml=pytest-junit.xml || [ $? -eq 5 ]
+  artifacts:
+    when: always
+    reports:
+      junit: pytest-junit.xml
+
+# Shared by the image jobs: checks the tag and names the image. POSIX sh, for the busybox of kaniko.
+.flightroom-image-name: &flightroom-image-name
+  - |
+    set -eu
+    VERSION="$CI_COMMIT_TAG"
+    case "$VERSION" in
+      "" | [.-]* | *[!A-Za-z0-9._-]*)
+        echo "The tag is not a valid version: letters, digits, '.', '_' and '-' only, not starting with '.' or '-'"
+        exit 1 ;;
+    esac
+    if [ "${#VERSION}" -gt 128 ]; then echo "The tag is longer than 128 characters"; exit 1; fi
+    REPOSITORY="$FLIGHTROOM_IMAGE_REPOSITORY"
+    if [ -z "$REPOSITORY" ] && [ -n "$FLIGHTROOM_IMAGE_PREFIX" ]; then REPOSITORY="${FLIGHTROOM_IMAGE_PREFIX%/}/$FLIGHTROOM_SLUG"; fi
+    if [ -z "$REPOSITORY" ]; then REPOSITORY="$CI_REGISTRY_IMAGE"; fi
+    REPOSITORY=$(printf '%s' "$REPOSITORY" | tr '[:upper:]' '[:lower:]')
+    case "$REPOSITORY" in
+      "" | */ | *[!a-z0-9._:/-]*)
+        echo "No valid image repository: set FLIGHTROOM_IMAGE_REPOSITORY or FLIGHTROOM_IMAGE_PREFIX, or enable the GitLab container registry"
+        exit 1 ;;
+    esac
+    IMAGE="$REPOSITORY:$VERSION"
+    REGISTRY="${REPOSITORY%%/*}"
+    echo "Image: $IMAGE"
+
+.flightroom-docker:
+  stage: image
+  image: $FLIGHTROOM_DOCKER_IMAGE
+  script:
+    - *flightroom-image-name
+    - printf '%s' "$FLIGHTROOM_REGISTRY_PASSWORD" | docker login -u "$FLIGHTROOM_REGISTRY_USER" --password-stdin "$REGISTRY"
+    # The Dockerfile builds the application itself (multi-stage)
+    - DOCKER_BUILDKIT=1 docker build -t "$IMAGE" .
+    - docker push "$IMAGE"
+    - DIGEST=$(docker image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "$IMAGE" | awk -F@ -v r="$REPOSITORY" '!f && $1 == r { print $2; f = 1 }')
+    - printf 'FLIGHTROOM_IMAGE=%s\nFLIGHTROOM_DIGEST=%s\n' "$IMAGE" "$DIGEST" > image.env
+  artifacts:
+    reports:
+      dotenv: image.env
+
+image-dind:
+  extends: .flightroom-docker
+  services:
+    - name: $FLIGHTROOM_DIND_IMAGE
+      alias: docker
+  variables:
+    DOCKER_TLS_CERTDIR: /certs
+  rules:
+    - if: $CI_COMMIT_TAG && $FLIGHTROOM_IMAGE_BUILDER == "dind"
+
+image-docker:
+  extends: .flightroom-docker
+  rules:
+    - if: $CI_COMMIT_TAG && $FLIGHTROOM_IMAGE_BUILDER == "docker"
+
+# Kaniko does not support every BuildKit feature (RUN --mount=type=cache in particular is only a cache
+# hint there): prefer dind or docker when the Dockerfile relies on them
+image-kaniko:
+  stage: image
+  image:
+    name: $FLIGHTROOM_KANIKO_IMAGE
+    entrypoint: [""]
+  rules:
+    - if: $CI_COMMIT_TAG && $FLIGHTROOM_IMAGE_BUILDER == "kaniko"
+  script:
+    - *flightroom-image-name
+    - mkdir -p /kaniko/.docker
+    - AUTH=$(printf '%s:%s' "$FLIGHTROOM_REGISTRY_USER" "$FLIGHTROOM_REGISTRY_PASSWORD" | base64 | tr -d '\n')
+    - printf '{"auths":{"%s":{"auth":"%s"}}}' "$REGISTRY" "$AUTH" > /kaniko/.docker/config.json
+    - /kaniko/executor --context "$CI_PROJECT_DIR" --dockerfile "$CI_PROJECT_DIR/Dockerfile" --destination "$IMAGE" --digest-file "$CI_PROJECT_DIR/digest.txt"
+    - printf 'FLIGHTROOM_IMAGE=%s\nFLIGHTROOM_DIGEST=%s\n' "$IMAGE" "$(cat "$CI_PROJECT_DIR/digest.txt")" > image.env
+  artifacts:
+    reports:
+      dotenv: image.env
+
+# FLIGHTROOM_IMAGE and FLIGHTROOM_DIGEST come from the image job that ran, through its dotenv report
+register:
+  stage: register
+  image:
+    name: $FLIGHTROOM_CURL_IMAGE
+    entrypoint: [""]
+  variables:
+    GIT_STRATEGY: none
+  needs:
+    - job: image-dind
+      optional: true
+    - job: image-docker
+      optional: true
+    - job: image-kaniko
+      optional: true
+  rules:
+    - if: $CI_COMMIT_TAG
+  script:
+    - |
+      set -eu
+      if [ -z "${FLIGHTROOM_IMAGE:-}" ]; then
+        echo "No image was built: FLIGHTROOM_IMAGE_BUILDER must be dind, docker or kaniko"
+        exit 1
+      fi
+      if [ -z "${FLIGHTROOM_API_KEY:-}" ]; then
+        echo "The CI/CD variable FLIGHTROOM_API_KEY is not set"
+        exit 1
+      fi
+      # Both were checked by the image job; checked again since they end up in a URL and in JSON
+      case "$CI_COMMIT_TAG$FLIGHTROOM_IMAGE" in
+        *[!A-Za-z0-9._:/-]*) echo "Unexpected characters in the tag or the image"; exit 1 ;;
+      esac
+      BODY="{\"image\":\"$FLIGHTROOM_IMAGE\",\"commitSha\":\"$CI_COMMIT_SHA\""
+      HEX="${FLIGHTROOM_DIGEST:-}"
+      HEX="${HEX#sha256:}"
+      case "$HEX" in
+        "" | *[!0-9a-f]*) ;;
+        *) if [ "${#HEX}" -eq 64 ]; then BODY="$BODY,\"digest\":\"sha256:$HEX\""; fi ;;
+      esac
+      BODY="$BODY}"
+      BASE="${FLIGHTROOM_DOMAIN%/}"
+      BASE="${BASE%/api}"
+      URL="$BASE/api/backends/by-slug/$FLIGHTROOM_SLUG/versions/$CI_COMMIT_TAG"
+      echo "Registering $FLIGHTROOM_IMAGE: POST $URL"
+      # The key goes in through stdin, so it never shows in the process list of a shared runner
+      printf 'api-key: %s\n' "$FLIGHTROOM_API_KEY" \
+        | curl --fail-with-body --show-error --silent --retry 3 -X POST -H @- \
+          -H 'Content-Type: application/json' -H 'Accept: application/json' --data "$BODY" "$URL"

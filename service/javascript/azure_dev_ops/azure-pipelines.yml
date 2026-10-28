@@ -1,0 +1,210 @@
+# Flightroom pipeline: Node.js / TypeScript backend (Fastify, Express, NestJS...), with pnpm.
+#
+# Pushes to main and pull requests: install, test and build.
+# A tag <version>: install, test and build, then the image <registry>/<prefix>/<slug>:<version> is built from
+# the repository's Dockerfile, pushed, and registered as that version of the backend in Flightroom.
+#
+# Set up once per Azure DevOps project (see the README of the pipeline models repository):
+#   Variable group MFE_ORCHESTRATOR_SECRETS
+#     FLIGHTROOM_API_KEY                  secret: an API key of the Flightroom project with the MANAGER role
+#     FLIGHTROOM_REGISTRY_HOST            optional: registry host in the image reference sent to Flightroom
+#                                         (e.g. acme.azurecr.io); found from the pushed image when left out
+#     FLIGHTROOM_IMAGE_REPOSITORY_PREFIX  optional: path before the slug (e.g. platform → platform/<slug>)
+#     FLIGHTROOM_DOMAIN                   optional: Flightroom base URL, defaults to %domain%
+#   A Docker registry service connection, named as the registryServiceConnection parameter below.
+#   An internal npm registry goes in the repository's .npmrc; corepack fetches pnpm from
+#   COREPACK_NPM_REGISTRY when set (a pipeline variable).
+#
+# The parameters below are read when the pipeline is compiled. Change their defaults in your pipeline
+# models repository: every repository Flightroom creates afterwards gets them.
+
+parameters:
+  - name: agentPool
+    displayName: Agent pool ("Azure Pipelines" is the Microsoft-hosted one)
+    type: string
+    default: Azure Pipelines
+  - name: vmImage
+    displayName: Microsoft-hosted image (ignored on a self-hosted pool)
+    type: string
+    default: ubuntu-latest
+  - name: registryServiceConnection
+    displayName: Docker registry service connection
+    type: string
+    default: flightroom-registry
+  - name: nodeVersion
+    displayName: Node.js version
+    type: string
+    default: '24.x'
+
+trigger:
+  branches:
+    include:
+      - main
+  tags:
+    include:
+      - '*'
+
+# GitHub and Bitbucket only: Azure Repos validates pull requests through a build policy on main
+pr:
+  branches:
+    include:
+      - main
+
+pool:
+  name: ${{ parameters.agentPool }}
+  ${{ if eq(parameters.agentPool, 'Azure Pipelines') }}:
+    vmImage: ${{ parameters.vmImage }}
+
+variables:
+  FLIGHTROOM_SLUG: '%serviceSlug%'
+  PNPM_STORE: $(Pipeline.Workspace)/.pnpm-store
+
+stages:
+  - stage: Build
+    displayName: Build and test
+    jobs:
+      - job: Build
+        displayName: Install, test and build
+        steps:
+          - task: NodeTool@0
+            displayName: Use Node.js ${{ parameters.nodeVersion }}
+            inputs:
+              versionSpec: ${{ parameters.nodeVersion }}
+
+          # pnpm comes in the version of the packageManager field of package.json. Node.js 25 and later no
+          # longer bundle corepack: npm installs it then, from the registry npm is configured with.
+          - script: |
+              set -euo pipefail
+              command -v corepack > /dev/null || npm install --global corepack
+              corepack enable
+            displayName: Enable pnpm
+
+          - task: Cache@2
+            displayName: Cache the pnpm store
+            inputs:
+              key: 'pnpm | "$(Agent.OS)" | pnpm-lock.yaml'
+              restoreKeys: |
+                pnpm | "$(Agent.OS)"
+              path: $(PNPM_STORE)
+
+          - script: pnpm install --frozen-lockfile --store-dir "$PNPM_STORE"
+            displayName: Install dependencies
+
+          - script: pnpm run --if-present test
+            displayName: Test
+
+          - script: pnpm run --if-present build
+            displayName: Build
+
+          # Published when the test script writes JUnit (e.g. vitest --reporter=junit --outputFile=test-results/junit.xml)
+          - task: PublishTestResults@2
+            displayName: Publish test results
+            condition: succeededOrFailed()
+            inputs:
+              testResultsFormat: JUnit
+              testResultsFiles: |
+                **/test-results/**/*.xml
+                **/junit*.xml
+                !**/node_modules/**
+              testRunTitle: Tests
+
+  - stage: Release
+    displayName: Release
+    dependsOn: Build
+    condition: and(succeeded(), startsWith(variables['Build.SourceBranch'], 'refs/tags/'))
+    variables:
+      # Defaults first: the group is listed after them, so a value it holds wins
+      - name: FLIGHTROOM_DOMAIN
+        value: '%domain%'
+      - name: FLIGHTROOM_REGISTRY_HOST
+        value: ''
+      - name: FLIGHTROOM_IMAGE_REPOSITORY_PREFIX
+        value: ''
+      - group: MFE_ORCHESTRATOR_SECRETS
+    jobs:
+      - job: Release
+        displayName: Push and register the image
+        steps:
+          # Pipeline values reach every script through env only: a $(…) macro pasted into a script body is
+          # substituted as text before bash runs, so a tag could inject shell. The tag is never echoed either,
+          # since "##vso[" in it would be read as a logging command.
+          - script: |
+              set -euo pipefail
+              version="${BUILD_SOURCEBRANCH#refs/tags/}"
+              if ! [[ "$version" =~ ^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$ ]]; then
+                echo "##vso[task.logissue type=error]The tag is not a valid version: letters, digits, '.', '_' and '-' only, at most 128, not starting with '.' or '-'"
+                exit 1
+              fi
+              repository="${SLUG,,}"
+              prefix="${PREFIX%/}"
+              if [ -n "$prefix" ]; then repository="${prefix,,}/$repository"; fi
+              if ! [[ "$repository" =~ ^[a-z0-9][a-z0-9._/-]*$ ]]; then
+                echo "##vso[task.logissue type=error]FLIGHTROOM_IMAGE_REPOSITORY_PREFIX does not make a valid image repository"
+                exit 1
+              fi
+              echo "##vso[task.setvariable variable=FLIGHTROOM_VERSION]$version"
+              echo "##vso[task.setvariable variable=FLIGHTROOM_IMAGE_REPOSITORY]$repository"
+            displayName: Check the version and name the image
+            env:
+              SLUG: $(FLIGHTROOM_SLUG)
+              PREFIX: $(FLIGHTROOM_IMAGE_REPOSITORY_PREFIX)
+
+          # The Dockerfile builds the application itself (multi-stage)
+          - task: Docker@2
+            displayName: Build and push the image
+            inputs:
+              command: buildAndPush
+              containerRegistry: ${{ parameters.registryServiceConnection }}
+              repository: $(FLIGHTROOM_IMAGE_REPOSITORY)
+              Dockerfile: $(Build.SourcesDirectory)/Dockerfile
+              buildContext: $(Build.SourcesDirectory)
+              tags: $(FLIGHTROOM_VERSION)
+            env:
+              DOCKER_BUILDKIT: 1
+
+          - script: |
+              set -euo pipefail
+              case "$FLIGHTROOM_API_KEY" in
+                '' | '$('*)
+                  echo "##vso[task.logissue type=error]FLIGHTROOM_API_KEY is not set: add it as a secret to the variable group MFE_ORCHESTRATOR_SECRETS"
+                  exit 1 ;;
+              esac
+              host="${REGISTRY_HOST,,}"
+              host="${host#https://}"
+              host="${host%/}"
+              if [ -n "$host" ]; then
+                image="$host/$IMAGE_REPOSITORY:$VERSION"
+              else
+                # Docker@2 tagged the image with the login server of the service connection
+                image=$(docker image ls --format '{{.Repository}}:{{.Tag}}' \
+                  | awk -v want="/$IMAGE_REPOSITORY:$VERSION" '!found && length($0) > length(want) && substr($0, length($0) - length(want) + 1) == want { print; found = 1 }')
+              fi
+              if ! [[ "$image" =~ ^[a-z0-9][a-z0-9._:/-]*$ ]]; then
+                echo "##vso[task.logissue type=error]Could not tell the registry host of the image: set FLIGHTROOM_REGISTRY_HOST in the variable group MFE_ORCHESTRATOR_SECRETS"
+                exit 1
+              fi
+              digest=$(docker image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "$image" \
+                | awk -F@ -v repository="${image%:*}" '!found && $1 == repository { print $2; found = 1 }')
+
+              body="{\"image\":\"$image\""
+              if [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then body+=",\"digest\":\"$digest\""; fi
+              if [[ "$COMMIT_SHA" =~ ^[0-9a-f]{7,64}$ ]]; then body+=",\"commitSha\":\"$COMMIT_SHA\""; fi
+              body+="}"
+
+              base="${FLIGHTROOM_DOMAIN%/}"
+              base="${base%/api}"
+              url="$base/api/backends/by-slug/$SLUG/versions/$VERSION"
+              echo "Registering $image: POST $url"
+              # The key goes in through stdin, so it never shows in the process list of a shared agent
+              printf 'api-key: %s\n' "$FLIGHTROOM_API_KEY" \
+                | curl --fail-with-body --show-error --silent --retry 3 -X POST -H @- \
+                  -H 'Content-Type: application/json' -H 'Accept: application/json' --data "$body" "$url"
+            displayName: Register the version in Flightroom
+            env:
+              FLIGHTROOM_API_KEY: $(FLIGHTROOM_API_KEY)
+              FLIGHTROOM_DOMAIN: $(FLIGHTROOM_DOMAIN)
+              REGISTRY_HOST: $(FLIGHTROOM_REGISTRY_HOST)
+              IMAGE_REPOSITORY: $(FLIGHTROOM_IMAGE_REPOSITORY)
+              VERSION: $(FLIGHTROOM_VERSION)
+              SLUG: $(FLIGHTROOM_SLUG)
+              COMMIT_SHA: $(Build.SourceVersion)

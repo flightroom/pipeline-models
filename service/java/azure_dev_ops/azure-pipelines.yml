@@ -1,0 +1,223 @@
+# Flightroom pipeline: Java backend (Spring Boot, Quarkus, Micronaut...), Maven or Gradle.
+#
+# Pushes to main and pull requests: build and test.
+# A tag <version>: build and test, then the image <registry>/<prefix>/<slug>:<version> is built from the
+# repository's Dockerfile, pushed, and registered as that version of the backend in Flightroom.
+#
+# Set up once per Azure DevOps project (see the README of the pipeline models repository):
+#   Variable group MFE_ORCHESTRATOR_SECRETS
+#     FLIGHTROOM_API_KEY                  secret: an API key of the Flightroom project with the MANAGER role
+#     FLIGHTROOM_REGISTRY_HOST            optional: registry host in the image reference sent to Flightroom
+#                                         (e.g. acme.azurecr.io); found from the pushed image when left out
+#     FLIGHTROOM_IMAGE_REPOSITORY_PREFIX  optional: path before the slug (e.g. platform → platform/<slug>)
+#     FLIGHTROOM_DOMAIN                   optional: Flightroom base URL, defaults to %domain%
+#   A Docker registry service connection, named as the registryServiceConnection parameter below.
+#
+# The parameters below are read when the pipeline is compiled. Change their defaults in your pipeline
+# models repository: every repository Flightroom creates afterwards gets them.
+
+parameters:
+  - name: agentPool
+    displayName: Agent pool ("Azure Pipelines" is the Microsoft-hosted one)
+    type: string
+    default: Azure Pipelines
+  - name: vmImage
+    displayName: Microsoft-hosted image (ignored on a self-hosted pool)
+    type: string
+    default: ubuntu-latest
+  - name: registryServiceConnection
+    displayName: Docker registry service connection
+    type: string
+    default: flightroom-registry
+  - name: javaVersion
+    displayName: JDK version (pre-installed on the agent)
+    type: string
+    default: '25'
+
+trigger:
+  branches:
+    include:
+      - main
+  tags:
+    include:
+      - '*'
+
+# GitHub and Bitbucket only: Azure Repos validates pull requests through a build policy on main
+pr:
+  branches:
+    include:
+      - main
+
+pool:
+  name: ${{ parameters.agentPool }}
+  ${{ if eq(parameters.agentPool, 'Azure Pipelines') }}:
+    vmImage: ${{ parameters.vmImage }}
+
+variables:
+  FLIGHTROOM_SLUG: '%serviceSlug%'
+  # Maven and Gradle both download into this folder, so one cache covers either
+  JAVA_CACHE: $(Pipeline.Workspace)/.java-cache
+  MAVEN_OPTS: -Dmaven.repo.local=$(Pipeline.Workspace)/.java-cache/m2
+  GRADLE_USER_HOME: $(Pipeline.Workspace)/.java-cache/gradle
+
+stages:
+  - stage: Build
+    displayName: Build and test
+    jobs:
+      - job: Build
+        displayName: Build and test
+        steps:
+          - task: JavaToolInstaller@0
+            displayName: Use JDK ${{ parameters.javaVersion }}
+            inputs:
+              versionSpec: ${{ parameters.javaVersion }}
+              jdkArchitectureOption: x64
+              jdkSourceOption: PreInstalled
+
+          # The cache key hashes every build file, whichever of Maven or Gradle the repository uses
+          - script: |
+              set -euo pipefail
+              find . -path ./.git -prune -o -type f \( -name pom.xml -o -name '*.gradle' -o -name '*.gradle.kts' \
+                -o -name libs.versions.toml -o -name gradle-wrapper.properties -o -name maven-wrapper.properties \) -print0 \
+                | sort -z | xargs -0 cat > "$AGENT_TEMPDIRECTORY/java-build-files"
+            displayName: Collect the build files for the cache key
+
+          - task: Cache@2
+            displayName: Cache Maven and Gradle downloads
+            inputs:
+              key: 'java | "$(Agent.OS)" | $(Agent.TempDirectory)/java-build-files'
+              restoreKeys: |
+                java | "$(Agent.OS)"
+              path: $(JAVA_CACHE)
+
+          # The wrapper pins the build tool; point its distributionUrl to an internal mirror if the agent has
+          # no internet access. Maven reads a mirror from .mvn/maven.config or settings.xml as usual.
+          - script: |
+              set -euo pipefail
+              if [ -f mvnw ]; then
+                chmod +x mvnw
+                ./mvnw -B --no-transfer-progress verify
+              elif [ -f gradlew ]; then
+                chmod +x gradlew
+                ./gradlew --no-daemon build
+              elif [ -f pom.xml ]; then
+                mvn -B --no-transfer-progress verify
+              elif [ -f build.gradle ] || [ -f build.gradle.kts ]; then
+                gradle --no-daemon build
+              else
+                echo "##vso[task.logissue type=error]No mvnw, gradlew, pom.xml or build.gradle(.kts) at the root of the repository"
+                exit 1
+              fi
+            displayName: Build and test
+
+          - task: PublishTestResults@2
+            displayName: Publish test results
+            condition: succeededOrFailed()
+            inputs:
+              testResultsFormat: JUnit
+              testResultsFiles: |
+                **/target/surefire-reports/TEST-*.xml
+                **/target/failsafe-reports/TEST-*.xml
+                **/build/test-results/**/TEST-*.xml
+              testRunTitle: Tests
+
+  - stage: Release
+    displayName: Release
+    dependsOn: Build
+    condition: and(succeeded(), startsWith(variables['Build.SourceBranch'], 'refs/tags/'))
+    variables:
+      # Defaults first: the group is listed after them, so a value it holds wins
+      - name: FLIGHTROOM_DOMAIN
+        value: '%domain%'
+      - name: FLIGHTROOM_REGISTRY_HOST
+        value: ''
+      - name: FLIGHTROOM_IMAGE_REPOSITORY_PREFIX
+        value: ''
+      - group: MFE_ORCHESTRATOR_SECRETS
+    jobs:
+      - job: Release
+        displayName: Push and register the image
+        steps:
+          # Pipeline values reach every script through env only: a $(…) macro pasted into a script body is
+          # substituted as text before bash runs, so a tag could inject shell. The tag is never echoed either,
+          # since "##vso[" in it would be read as a logging command.
+          - script: |
+              set -euo pipefail
+              version="${BUILD_SOURCEBRANCH#refs/tags/}"
+              if ! [[ "$version" =~ ^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$ ]]; then
+                echo "##vso[task.logissue type=error]The tag is not a valid version: letters, digits, '.', '_' and '-' only, at most 128, not starting with '.' or '-'"
+                exit 1
+              fi
+              repository="${SLUG,,}"
+              prefix="${PREFIX%/}"
+              if [ -n "$prefix" ]; then repository="${prefix,,}/$repository"; fi
+              if ! [[ "$repository" =~ ^[a-z0-9][a-z0-9._/-]*$ ]]; then
+                echo "##vso[task.logissue type=error]FLIGHTROOM_IMAGE_REPOSITORY_PREFIX does not make a valid image repository"
+                exit 1
+              fi
+              echo "##vso[task.setvariable variable=FLIGHTROOM_VERSION]$version"
+              echo "##vso[task.setvariable variable=FLIGHTROOM_IMAGE_REPOSITORY]$repository"
+            displayName: Check the version and name the image
+            env:
+              SLUG: $(FLIGHTROOM_SLUG)
+              PREFIX: $(FLIGHTROOM_IMAGE_REPOSITORY_PREFIX)
+
+          # The Dockerfile builds the application itself (multi-stage)
+          - task: Docker@2
+            displayName: Build and push the image
+            inputs:
+              command: buildAndPush
+              containerRegistry: ${{ parameters.registryServiceConnection }}
+              repository: $(FLIGHTROOM_IMAGE_REPOSITORY)
+              Dockerfile: $(Build.SourcesDirectory)/Dockerfile
+              buildContext: $(Build.SourcesDirectory)
+              tags: $(FLIGHTROOM_VERSION)
+            env:
+              DOCKER_BUILDKIT: 1
+
+          - script: |
+              set -euo pipefail
+              case "$FLIGHTROOM_API_KEY" in
+                '' | '$('*)
+                  echo "##vso[task.logissue type=error]FLIGHTROOM_API_KEY is not set: add it as a secret to the variable group MFE_ORCHESTRATOR_SECRETS"
+                  exit 1 ;;
+              esac
+              host="${REGISTRY_HOST,,}"
+              host="${host#https://}"
+              host="${host%/}"
+              if [ -n "$host" ]; then
+                image="$host/$IMAGE_REPOSITORY:$VERSION"
+              else
+                # Docker@2 tagged the image with the login server of the service connection
+                image=$(docker image ls --format '{{.Repository}}:{{.Tag}}' \
+                  | awk -v want="/$IMAGE_REPOSITORY:$VERSION" '!found && length($0) > length(want) && substr($0, length($0) - length(want) + 1) == want { print; found = 1 }')
+              fi
+              if ! [[ "$image" =~ ^[a-z0-9][a-z0-9._:/-]*$ ]]; then
+                echo "##vso[task.logissue type=error]Could not tell the registry host of the image: set FLIGHTROOM_REGISTRY_HOST in the variable group MFE_ORCHESTRATOR_SECRETS"
+                exit 1
+              fi
+              digest=$(docker image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "$image" \
+                | awk -F@ -v repository="${image%:*}" '!found && $1 == repository { print $2; found = 1 }')
+
+              body="{\"image\":\"$image\""
+              if [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then body+=",\"digest\":\"$digest\""; fi
+              if [[ "$COMMIT_SHA" =~ ^[0-9a-f]{7,64}$ ]]; then body+=",\"commitSha\":\"$COMMIT_SHA\""; fi
+              body+="}"
+
+              base="${FLIGHTROOM_DOMAIN%/}"
+              base="${base%/api}"
+              url="$base/api/backends/by-slug/$SLUG/versions/$VERSION"
+              echo "Registering $image: POST $url"
+              # The key goes in through stdin, so it never shows in the process list of a shared agent
+              printf 'api-key: %s\n' "$FLIGHTROOM_API_KEY" \
+                | curl --fail-with-body --show-error --silent --retry 3 -X POST -H @- \
+                  -H 'Content-Type: application/json' -H 'Accept: application/json' --data "$body" "$url"
+            displayName: Register the version in Flightroom
+            env:
+              FLIGHTROOM_API_KEY: $(FLIGHTROOM_API_KEY)
+              FLIGHTROOM_DOMAIN: $(FLIGHTROOM_DOMAIN)
+              REGISTRY_HOST: $(FLIGHTROOM_REGISTRY_HOST)
+              IMAGE_REPOSITORY: $(FLIGHTROOM_IMAGE_REPOSITORY)
+              VERSION: $(FLIGHTROOM_VERSION)
+              SLUG: $(FLIGHTROOM_SLUG)
+              COMMIT_SHA: $(Build.SourceVersion)

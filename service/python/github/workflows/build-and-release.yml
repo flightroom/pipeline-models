@@ -1,0 +1,143 @@
+# Flightroom pipeline: Python backend (FastAPI...), installed with pip.
+#
+# Pushes to main and pull requests: install and test (pytest).
+# A tag <version>: install and test, then the image <registry>/<prefix>/<slug>:<version> is built from the
+# repository's Dockerfile, pushed, and registered as that version of the backend in Flightroom.
+#
+# Set up once, on the organization or the repository (see the README of the pipeline models repository):
+#   Secret   FLIGHTROOM_API_KEY                  an API key of the Flightroom project with the MANAGER role
+#   Variable FLIGHTROOM_DOMAIN                   optional: Flightroom base URL, defaults to %domain%
+#   Variable FLIGHTROOM_REGISTRY                 optional: registry host, defaults to ghcr.io
+#   Variable FLIGHTROOM_IMAGE_REPOSITORY_PREFIX  optional: path before the slug, defaults to the repository owner
+#   Variable FLIGHTROOM_REGISTRY_USERNAME        optional: registry user, defaults to the workflow's actor
+#   Secret   FLIGHTROOM_REGISTRY_PASSWORD        optional: registry password, defaults to GITHUB_TOKEN (ghcr.io)
+#   Variable FLIGHTROOM_RUNNER                   optional: runner label, defaults to ubuntu-latest
+#   Variable FLIGHTROOM_PYTHON_VERSION           optional: Python version, defaults to 3.15
+
+name: Build and release
+
+on:
+  push:
+    branches: [main]
+    tags: ['*']
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  FLIGHTROOM_SLUG: '%serviceSlug%'
+
+jobs:
+  build:
+    name: Install and test
+    runs-on: ${{ vars.FLIGHTROOM_RUNNER || 'ubuntu-latest' }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ vars.FLIGHTROOM_PYTHON_VERSION || '3.15' }}
+          cache: pip
+          cache-dependency-path: |
+            **/pyproject.toml
+            **/requirements*.txt
+            **/constraints.txt
+
+      # constraints.txt pins every version when the repository has one; the project's "dev" extra brings
+      # the test tools
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          constraints=()
+          if [ -f constraints.txt ]; then constraints=(-c constraints.txt); fi
+          if [ -f requirements.txt ]; then python -m pip install ${constraints[@]+"${constraints[@]}"} -r requirements.txt; fi
+          if [ -f requirements-dev.txt ]; then python -m pip install ${constraints[@]+"${constraints[@]}"} -r requirements-dev.txt; fi
+          if [ -f pyproject.toml ] || [ -f setup.py ]; then python -m pip install ${constraints[@]+"${constraints[@]}"} -e ".[dev]"; fi
+
+      - name: Test
+        run: |
+          set -uo pipefail
+          python -m pytest
+          status=$?
+          # 5: no test collected, which a repository just created may well be
+          if [ "$status" -eq 5 ]; then
+            echo "::warning::pytest found no test"
+            exit 0
+          fi
+          exit "$status"
+
+  release:
+    name: Push and register the image
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ${{ vars.FLIGHTROOM_RUNNER || 'ubuntu-latest' }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+
+      # Values reach the scripts through env only: ${{ }} pasted into a script body is substituted as text
+      # before bash runs, so a tag could inject shell
+      - name: Check the version and name the image
+        id: image
+        env:
+          VERSION: ${{ github.ref_name }}
+          REGISTRY: ${{ vars.FLIGHTROOM_REGISTRY || 'ghcr.io' }}
+          PREFIX: ${{ vars.FLIGHTROOM_IMAGE_REPOSITORY_PREFIX || github.repository_owner }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$VERSION" =~ ^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$ ]]; then
+            echo "::error::The tag is not a valid version: letters, digits, '.', '_' and '-' only, at most 128, not starting with '.' or '-'"
+            exit 1
+          fi
+          prefix="${PREFIX%/}"
+          image="${REGISTRY,,}/${prefix:+${prefix,,}/}${FLIGHTROOM_SLUG,,}:$VERSION"
+          if ! [[ "$image" =~ ^[a-z0-9][a-z0-9._:/-]*$ ]]; then
+            echo "::error::FLIGHTROOM_REGISTRY and FLIGHTROOM_IMAGE_REPOSITORY_PREFIX do not make a valid image reference"
+            exit 1
+          fi
+          echo "ref=$image" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ${{ vars.FLIGHTROOM_REGISTRY || 'ghcr.io' }}
+          username: ${{ vars.FLIGHTROOM_REGISTRY_USERNAME || github.actor }}
+          password: ${{ secrets.FLIGHTROOM_REGISTRY_PASSWORD || secrets.GITHUB_TOKEN }}
+
+      # The Dockerfile builds the application itself (multi-stage)
+      - uses: docker/build-push-action@v7
+        id: build
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.image.outputs.ref }}
+
+      - name: Register the version in Flightroom
+        env:
+          FLIGHTROOM_API_KEY: ${{ secrets.FLIGHTROOM_API_KEY }}
+          FLIGHTROOM_DOMAIN: ${{ vars.FLIGHTROOM_DOMAIN || '%domain%' }}
+          IMAGE: ${{ steps.image.outputs.ref }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+          VERSION: ${{ github.ref_name }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [ -z "$FLIGHTROOM_API_KEY" ]; then
+            echo "::error::The secret FLIGHTROOM_API_KEY is not set"
+            exit 1
+          fi
+          body="{\"image\":\"$IMAGE\",\"commitSha\":\"$COMMIT_SHA\""
+          if [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then body+=",\"digest\":\"$DIGEST\""; fi
+          body+="}"
+          base="${FLIGHTROOM_DOMAIN%/}"
+          base="${base%/api}"
+          url="$base/api/backends/by-slug/$FLIGHTROOM_SLUG/versions/$VERSION"
+          echo "Registering $IMAGE: POST $url"
+          # The key goes in through stdin, so it never shows in the process list of a shared runner
+          printf 'api-key: %s\n' "$FLIGHTROOM_API_KEY" \
+            | curl --fail-with-body --show-error --silent --retry 3 -X POST -H @- \
+              -H 'Content-Type: application/json' -H 'Accept: application/json' --data "$body" "$url"
